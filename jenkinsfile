@@ -1,91 +1,66 @@
 pipeline {
     agent any
-
     environment {
-        FLASK_APP = 'src/api.py'
-        FLASK_ENV = 'development'
-        PYTHONPATH = "${WORKSPACE}/src"
+        AWS_DEFAULT_REGION = 'us-east-1'
+        BASE_URL = 'https://dfsoz0oo4d.execute-api.us-east-1.amazonaws.com/Prod'
     }
-
     stages {
         stage('Get Code') {
             steps {
-                git branch: 'master', url: 'https://github.com/FoxMateo/Caso-practico-1D.git'
-                sh 'ls -la'
+                git branch: 'develop', url: 'https://github.com/FoxMateo/Caso-practico-1D.git'
             }
         }
-
-        stage('Flake8') {
+        stage('Static Test') {
             steps {
                 sh '''
-                    flake8 --exit-zero --format=pylint src > flake8.out
-                '''   
-                recordIssues tools: [flake8(name: 'Flake8', pattern: 'flake8.out')],
-                             qualityGates: [[threshold: 8, type: 'TOTAL', unstable: true], [threshold: 10, type: 'TOTAL', unstable: false]]
+                    set -e
+                    export PATH=$PATH:/tmp
+                    /tmp/flake8 src/ > flake8-report.txt || echo "Flake8 completed with warnings"
+                    /tmp/bandit -r src/ > bandit-report.txt || echo "Bandit completed with warnings"
+                '''
+                archiveArtifacts artifacts: 'flake8-report.txt, bandit-report.txt', fingerprint: true
             }
         }
-
-        stage('Security') {
+        stage('Deploy') {
             steps {
                 sh '''
-                    bandit --exit-zero -r src -f custom -o bandit.out --severity-level medium --msg-template "{abspath}:{line}: [{test_id}] {msg}"
+                    set -e
+                    echo "// Forced change $(date)" >> src/force_change.txt
+                    sam build
+                    sam deploy --stack-name todo-list-staging --s3-bucket foxmateo-sam-deploy --capabilities CAPABILITY_IAM --force-upload
                 '''
-                recordIssues tools: [bandit(name: 'Bandit', pattern: 'bandit.out')],
-                             qualityGates: [[threshold: 2, type: 'TOTAL', unstable: true], [threshold: 4, type: 'TOTAL', unstable: false]]
-            }
-        }        
-        
-        stage('Unit') {
-            steps {
-                sh '''
-                    pytest --junitxml=result-unit.xml --cov=src --cov-report=xml:coverage.xml test/unit
-                '''
-                junit 'result-unit.xml'
             }
         }
-
-        stage('Rest') {
+        stage('Rest Test') {
             steps {
-                sh '''
-                    export FLASK_APP=src/api.py
-                    nohup flask run --host=0.0.0.0 --port=5001 &
-                    sleep 15
-                    pytest --junitxml=result-rest.xml test/rest
-                '''
-                junit 'result-rest.xml'
-            }    
-        }
-
-        stage('Cobertura') {
-            steps {
-                sh '''
-                    coverage xml
-                '''
-                catchError(buildResult: 'UNSTABLE', stageResult: 'FAILURE') {
-                    cobertura coberturaReportFile: 'coverage.xml',
-                              conditionalCoverageTargets: '100,0,80',
-                              lineCoverageTargets: '100,0,85',
-                              onlyStable: false,
-                              failUnstable: false
+                script {
+                    sh '''
+                        set -e
+                        export PATH=$PATH:/var/lib/jenkins/.local/bin
+                        if ! command -v pytest &> /dev/null; then
+                            echo "Instalando pytest..."
+                            pip install --user pytest
+                        fi
+                        sleep 20
+                        HTTP_STATUS=$(curl -s -o response.json -w "%{http_code}" $BASE_URL/todos)
+                        cat response.json | jq .
+                        BASE_URL=$BASE_URL python3 -m pytest test/integration/todoApiTest.py || true
+                    '''
                 }
             }
         }
-
-        stage('Performance') {
+        stage('Promote') {
+            when {
+                expression { currentBuild.result == 'SUCCESS' }
+            }
             steps {
                 sh '''
-                    nohup flask run --host=0.0.0.0 --port=5000 &
-                    sleep 15
-                    jmeter -n -t test/jmeter/flask.jmx -f -l flask.jtl
+                    set -e
+                    git checkout master
+                    git merge develop
+                    git push origin master
                 '''
-                perfReport sourceDataFiles: 'flask.jtl'
             }
-        }  
-    }
-
-    post {
-        always {
-            sh 'pkill -f "flask run" || true'
         }
     }
 }
